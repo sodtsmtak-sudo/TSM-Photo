@@ -1,0 +1,25 @@
+{
+  "entities": {
+    "Photo": {
+      "title": "Photo",
+      "description": "Metadata for an uploaded photo",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "url": { "type": "string" },
+        "name": { "type": "string" },
+        "size": { "type": "number" },
+        "type": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["id", "url", "name", "createdAt"]
+    }
+  },
+  "firestore": {
+    "photos": {
+      "schema": "Photo",
+      "description": "A collection of photos metadata"
+    }
+  }
+}

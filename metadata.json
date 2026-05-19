@@ -1,0 +1,6 @@
+{
+  "name": "TSM Photo",
+  "description": "A personal photo storage and gallery application with easy uploads and secure storage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
