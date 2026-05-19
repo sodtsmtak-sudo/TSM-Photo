@@ -2,10 +2,10 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import multer from 'multer';
-import fs from 'fs/promises';
 import { v4 as uuidv4 } from 'uuid';
 import cors from 'cors';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { createClient } from '@supabase/supabase-js';
 
 const app = express();
 const PORT = 3000;
@@ -14,42 +14,18 @@ const PORT = 3000;
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
+// Supabase setup
+const supabaseUrl = process.env.SUPABASE_URL || '';
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const supabase = createClient(supabaseUrl, supabaseKey);
+
 // Middleware
 app.use(cors());
 app.use(express.json());
 
 // Configure storage for images
-const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
-const DB_FILE = path.join(process.cwd(), 'db.json');
+const upload = multer({ storage: multer.memoryStorage() });
 
-// Ensure uploads directory exists
-async function ensureDirs() {
-  try {
-    await fs.mkdir(UPLOADS_DIR, { recursive: true });
-  } catch (err) {
-    console.error('Error creating uploads directory:', err);
-  }
-}
-ensureDirs();
-
-const storage = multer.diskStorage({
-  destination: async (req, file, cb) => {
-    try {
-      await fs.mkdir(UPLOADS_DIR, { recursive: true });
-      cb(null, UPLOADS_DIR);
-    } catch (err) {
-      cb(err as Error, UPLOADS_DIR);
-    }
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${uuidv4()}${ext}`);
-  },
-});
-
-const upload = multer({ storage });
-
-// Database logic
 interface Photo {
   id: string;
   url: string;
@@ -60,38 +36,50 @@ interface Photo {
   tags: string[];
 }
 
-async function getDB(): Promise<Photo[]> {
-  try {
-    const data = await fs.readFile(DB_FILE, 'utf-8');
-    return JSON.parse(data);
-  } catch (error) {
-    return [];
-  }
-}
-
-async function saveDB(photos: Photo[]) {
-  await fs.writeFile(DB_FILE, JSON.stringify(photos, null, 2));
-}
-
 // API Routes
 app.get('/api/photos', async (req, res) => {
-  const photos = await getDB();
-  res.json(photos.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
+  if (!supabaseUrl) return res.json([]);
+  const { data, error } = await supabase.from('photos').select('*').order('createdAt', { ascending: false });
+  if (error) {
+    console.error('Error fetching photos:', error);
+    return res.status(500).json({ error: 'Failed to fetch photos' });
+  }
+  res.json(data || []);
 });
 
 app.post('/api/photos', upload.array('photos', 100), async (req, res) => {
+  if (!supabaseUrl) return res.status(500).json({ error: 'Supabase URL not configured' });
+  
   const files = req.files as Express.Multer.File[];
   if (!files || files.length === 0) {
     return res.status(400).json({ error: 'No files uploaded' });
   }
 
-  const photos = await getDB();
   const newPhotos: Photo[] = [];
 
   for (const file of files) {
+    const ext = path.extname(file.originalname);
+    const fileName = `${uuidv4()}${ext}`;
+    
+    // Upload to Supabase Storage
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('photos')
+      .upload(fileName, file.buffer, {
+        contentType: file.mimetype,
+      });
+      
+    if (uploadError) {
+      console.error('Error uploading to storage:', uploadError);
+      continue; // Skip this file if upload fails
+    }
+
+    const { data: publicUrlData } = supabase.storage
+      .from('photos')
+      .getPublicUrl(fileName);
+
     const newPhoto: Photo = {
       id: uuidv4(),
-      url: `/uploads/${file.filename}`,
+      url: publicUrlData.publicUrl,
       name: file.originalname,
       size: file.size,
       type: file.mimetype,
@@ -99,14 +87,22 @@ app.post('/api/photos', upload.array('photos', 100), async (req, res) => {
       tags: [],
     };
     newPhotos.push(newPhoto);
-    photos.push(newPhoto);
   }
 
-  await saveDB(photos);
+  // Insert to Supabase DB
+  if (newPhotos.length > 0) {
+    const { error: dbError } = await supabase.from('photos').insert(newPhotos);
+    if (dbError) {
+      console.error('Error inserting photos to DB:', dbError);
+      return res.status(500).json({ error: 'Failed to save photo metadata' });
+    }
+  }
+
   res.status(201).json(newPhotos);
 });
 
 app.post('/api/photos/url', async (req, res) => {
+  if (!supabaseUrl) return res.status(500).json({ error: 'Supabase URL not configured' });
   const { url } = req.body;
   
   if (!url) {
@@ -141,13 +137,24 @@ app.post('/api/photos/url', async (req, res) => {
                 contentType === 'image/gif' ? '.gif' : '.jpg';
                 
     const fileName = `${uuidv4()}${ext}`;
-    const filePath = path.join(UPLOADS_DIR, fileName);
     
-    await fs.writeFile(filePath, buffer);
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('photos')
+      .upload(fileName, buffer, {
+        contentType: contentType,
+      });
+
+    if (uploadError) {
+      throw uploadError;
+    }
+
+    const { data: publicUrlData } = supabase.storage
+      .from('photos')
+      .getPublicUrl(fileName);
     
     const newPhoto: Photo = {
       id: uuidv4(),
-      url: `/uploads/${fileName}`,
+      url: publicUrlData.publicUrl,
       name: originalName + ext,
       size: buffer.length,
       type: contentType,
@@ -155,9 +162,8 @@ app.post('/api/photos/url', async (req, res) => {
       tags: [],
     };
     
-    const photos = await getDB();
-    photos.push(newPhoto);
-    await saveDB(photos);
+    const { error: dbError } = await supabase.from('photos').insert([newPhoto]);
+    if (dbError) throw dbError;
     
     res.status(201).json([newPhoto]);
   } catch (error) {
@@ -167,36 +173,45 @@ app.post('/api/photos/url', async (req, res) => {
 });
 
 app.delete('/api/photos/:id', async (req, res) => {
+  if (!supabaseUrl) return res.status(500).json({ error: 'Supabase URL not configured' });
   const { id } = req.params;
-  let photos = await getDB();
-  const photoToDelete = photos.find(p => p.id === id);
+  
+  // Get photo to find filename
+  const { data: photoData, error: checkError } = await supabase
+    .from('photos')
+    .select('url')
+    .eq('id', id)
+    .single();
 
-  if (!photoToDelete) {
+  if (checkError || !photoData) {
     return res.status(404).json({ error: 'Photo not found' });
   }
 
-  // Try to delete the file
-  const fileName = photoToDelete.url.split('/').pop();
+  const fileName = photoData.url.split('/').pop();
+  
   if (fileName) {
-    try {
-      await fs.unlink(path.join(UPLOADS_DIR, fileName));
-    } catch (err) {
-      console.error('Error deleting file:', err);
-    }
+    await supabase.storage.from('photos').remove([fileName]);
   }
 
-  photos = photos.filter(p => p.id !== id);
-  await saveDB(photos);
+  const { error: deleteError } = await supabase.from('photos').delete().eq('id', id);
+  if (deleteError) {
+    return res.status(500).json({ error: 'Failed to delete photo' });
+  }
 
   res.json({ message: 'Deleted successfully' });
 });
 
 app.post('/api/photos/:id/tag', async (req, res) => {
+  if (!supabaseUrl) return res.status(500).json({ error: 'Supabase URL not configured' });
   const { id } = req.params;
-  const photos = await getDB();
-  const photo = photos.find(p => p.id === id);
+  
+  const { data: photo, error: fetchError } = await supabase
+    .from('photos')
+    .select('*')
+    .eq('id', id)
+    .single();
 
-  if (!photo) {
+  if (fetchError || !photo) {
     return res.status(404).json({ error: 'Photo not found' });
   }
 
@@ -205,13 +220,14 @@ app.post('/api/photos/:id/tag', async (req, res) => {
   }
 
   try {
-    const filePath = path.join(UPLOADS_DIR, photo.url.split('/').pop()!);
-    const fileData = await fs.readFile(filePath);
+    const response = await fetch(photo.url);
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
     
     const result = await geminiModel.generateContent([
       {
         inlineData: {
-          data: fileData.toString('base64'),
+          data: buffer.toString('base64'),
           mimeType: photo.type
         }
       },
@@ -219,16 +235,23 @@ app.post('/api/photos/:id/tag', async (req, res) => {
     ]);
 
     const tags = result.response.text().split(',').map(t => t.trim().toLowerCase());
-    photo.tags = Array.from(new Set([...photo.tags, ...tags]));
+    const newTags = Array.from(new Set([...photo.tags, ...tags]));
     
-    await saveDB(photos);
-    res.json(photo);
+    const { data: updateData, error: updateError } = await supabase
+      .from('photos')
+      .update({ tags: newTags })
+      .eq('id', id)
+      .select()
+      .single();
+      
+    if (updateError) throw updateError;
+    
+    res.json(updateData);
   } catch (error) {
     console.error('AI Tagging error:', error);
     res.status(500).json({ error: 'Failed to generate tags' });
   }
 });
-app.use('/uploads', express.static(UPLOADS_DIR));
 
 // Vite middleware for development
 async function startServer() {
@@ -246,9 +269,13 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
+  if (process.env.NODE_ENV !== 'production' || process.env.VERCEL !== '1') {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  }
 }
 
 startServer();
+
+export default app;
